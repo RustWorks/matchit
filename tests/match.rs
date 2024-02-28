@@ -1,5 +1,18 @@
 use matchit::{MatchError, Router};
 
+#[test]
+fn param_suffix() {
+    let mut x = Router::new();
+    x.insert("/{foo}x", "Welcome!").unwrap();
+    assert_eq!(x.at("/fy").unwrap_err(), MatchError::NotFound);
+    dbg!(x.at("/fx").unwrap());
+
+    let mut x = Router::new();
+    x.insert("/{foo}x/bar", "Welcome!").unwrap();
+    assert_eq!(x.at("/fy/bar").unwrap_err(), MatchError::NotFound);
+    dbg!(x.at("/fx/bar").unwrap());
+}
+
 // https://github.com/ibraheemdev/matchit/issues/22
 #[test]
 fn partial_overlap() {

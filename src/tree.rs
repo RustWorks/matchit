@@ -11,6 +11,9 @@ pub(crate) enum NodeType {
     Root,
     /// A route parameter, ex: `/{id}`.
     Param,
+    /// A route parameter that is followed by a static suffix
+    /// before a trailing slash, ex: `/{id}.png`.
+    ParamSuffix { suffix: Vec<u8> },
     /// A catchall parameter, ex: `/*file`
     CatchAll,
     /// Anything else
@@ -247,42 +250,68 @@ impl<T> Node<T> {
                 current.wild_child = true;
 
                 return Ok(&mut current.children[i]);
-            } else if wildcard[0] == b'{' {
-                // insert prefix before the current wildcard
-                if wildcard_index > 0 {
-                    current.prefix = prefix[..wildcard_index].to_owned();
-                    prefix = &prefix[wildcard_index..];
-                }
+            }
 
+            // insert prefix before the current wildcard
+            if wildcard_index > 0 {
+                current.prefix = prefix[..wildcard_index].to_owned();
+                prefix = &prefix[wildcard_index..];
+            }
+
+            let node_type = match prefix.get(wildcard.len()) {
+                None | Some(&b'/') => {
+                    prefix = &prefix[wildcard.len()..];
+                    NodeType::Param
+                }
+                // the route parameter is followed a static suffix within the current segment
+                _ => {
+                    let end = prefix
+                        .iter()
+                        .position(|&b| b == b'/')
+                        .unwrap_or(prefix.len());
+
+                    let suffix = &prefix[wildcard.len()..end];
+
+                    // multiple parameters within the same segment
+                    if matches!(find_wildcard(suffix), Ok(Some(_))) {
+                        return Err(InsertError::InvalidParam);
+                    }
+
+                    prefix = &prefix[end..];
+
+                    NodeType::ParamSuffix {
+                        suffix: suffix.to_owned(),
+                    }
+                }
+            };
+
+            let child = Self {
+                node_type: node_type.clone(),
+                prefix: wildcard.to_owned(),
+                ..Self::default()
+            };
+
+            let child = current.add_child(child);
+            current.wild_child = true;
+            current = &mut current.children[child];
+            current.priority += 1;
+
+            // if the route doesn't end with the wildcard, then there
+            // will be another static subroute or suffix
+            if wildcard.len() < prefix.len() {
                 let child = Self {
-                    node_type: NodeType::Param,
-                    prefix: wildcard.to_owned(),
+                    priority: 1,
                     ..Self::default()
                 };
 
                 let child = current.add_child(child);
-                current.wild_child = true;
                 current = &mut current.children[child];
-                current.priority += 1;
-
-                // if the route doesn't end with the wildcard, then there
-                // will be another non-wildcard subroute starting with '/'
-                if wildcard.len() < prefix.len() {
-                    prefix = &prefix[wildcard.len()..];
-                    let child = Self {
-                        priority: 1,
-                        ..Self::default()
-                    };
-
-                    let child = current.add_child(child);
-                    current = &mut current.children[child];
-                    continue;
-                }
-
-                // otherwise we're done. Insert the value in the new leaf
-                current.value = Some(UnsafeCell::new(val));
-                return Ok(current);
+                continue;
             }
+
+            // otherwise we're done. Insert the value in the new leaf
+            current.value = Some(UnsafeCell::new(val));
+            return Ok(current);
         }
     }
 }
@@ -373,7 +402,7 @@ impl<T> Node<T> {
                     // handle the wildcard child, which is always at the end of the list
                     current = current.children.last().unwrap();
 
-                    match current.node_type {
+                    match &current.node_type {
                         NodeType::Param => {
                             // check if there are more segments in the path other than this parameter
                             match path.iter().position(|&c| c == b'/') {
@@ -400,6 +429,60 @@ impl<T> Node<T> {
                                 None => {
                                     // store the parameter value
                                     params.push(b"", path);
+
+                                    // found the matching value
+                                    if let Some(ref value) = current.value {
+                                        // remap parameter keys
+                                        params.for_each_key_mut(|(i, key)| {
+                                            *key = &current.param_remapping[i]
+                                        });
+
+                                        return Ok((value, params));
+                                    }
+
+                                    // no match, try backtracking
+                                    try_backtrack!();
+
+                                    // this node doesn't have the value, no match
+                                    return Err(MatchError::NotFound);
+                                }
+                            }
+                        }
+                        NodeType::ParamSuffix { suffix } => {
+                            if path.len() < suffix.len() {
+                                return Err(MatchError::NotFound);
+                            }
+
+                            for i in 0..path.len() {
+                                if path[i] == b'/' {
+                                    return Err(MatchError::NotFound);
+                                }
+
+                                if path[i] == suffix[0] {
+                                    if path.len() - i < suffix.len() {
+                                        return Err(MatchError::NotFound);
+                                    }
+
+                                    if path[i..][..suffix.len()] != *suffix {
+                                        continue;
+                                    }
+
+                                    let param = &path[..i];
+                                    let rest = &path[i + suffix.len()..];
+
+                                    if let [child] = current.children.as_slice() {
+                                        // store the parameter value
+                                        params.push(b"", param);
+
+                                        // continue with the child node
+                                        path = rest;
+                                        current = child;
+                                        backtracking = false;
+                                        continue 'walk;
+                                    }
+
+                                    // store the parameter value
+                                    params.push(b"", param);
 
                                     // found the matching value
                                     if let Some(ref value) = current.value {
@@ -500,11 +583,6 @@ fn normalize_params(mut path: Vec<u8>) -> Result<(Vec<u8>, ParamRemapping), Inse
             None => return Ok((path, original)),
         };
 
-        // makes sure the param has a valid name
-        if wildcard.len() < 2 {
-            return Err(InsertError::InvalidParamName);
-        }
-
         // don't need to normalize catch-all parameters
         if wildcard[1] == b'*' {
             start += wildcard_index + wildcard.len();
@@ -584,13 +662,6 @@ fn find_wildcard(path: &[u8]) -> Result<Option<(&[u8], usize)>, InsertError> {
                         return Err(InsertError::InvalidParamName);
                     }
 
-                    if let Some(&c) = path.get(i + 1) {
-                        // prefixes after params are currently unsupported
-                        if c != b'/' {
-                            return Err(InsertError::InvalidParam);
-                        }
-                    }
-
                     return Ok(Some((&path[start..=i], start)));
                 }
                 b'*' | b'/' => return Err(InsertError::InvalidParamName),
@@ -665,14 +736,14 @@ const _: () = {
                 .map(|x| std::str::from_utf8(x).unwrap())
                 .collect::<Vec<_>>();
 
-            let mut fmt = f.debug_struct("Node");
-            fmt.field("value", &value);
-            fmt.field("prefix", &std::str::from_utf8(&self.prefix));
-            fmt.field("node_type", &self.node_type);
-            fmt.field("children", &self.children);
-            fmt.field("param_names", &param_names);
-            fmt.field("indices", &indices);
-            fmt.finish()
+            f.debug_struct("Node")
+                .field("value", &value)
+                .field("prefix", &std::str::from_utf8(&self.prefix))
+                .field("node_type", &self.node_type)
+                .field("children", &self.children)
+                .field("param_names", &param_names)
+                .field("indices", &indices)
+                .finish()
         }
     }
 };
