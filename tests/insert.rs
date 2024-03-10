@@ -7,7 +7,7 @@ impl InsertTest {
         let mut router = Router::new();
         for (route, expected) in self.0 {
             let got = router.insert(route, route.to_owned());
-            assert_eq!(got, expected);
+            assert_eq!(got, expected, "{route}");
         }
     }
 }
@@ -123,7 +123,7 @@ fn double_params() {
     InsertTest(vec![
         ("/{foo}{bar}", Err(InsertError::InvalidParam)),
         ("/{foo}{bar}/", Err(InsertError::InvalidParam)),
-        ("/{foo}{{*bar}/", Err(InsertError::InvalidParam)),
+        ("/{foo}{{*bar}/", Err(InsertError::InvalidParamName)),
     ])
     .run()
 }

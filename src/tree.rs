@@ -13,7 +13,7 @@ pub(crate) enum NodeType {
     Param,
     /// A route parameter that is followed by a static suffix
     /// before a trailing slash, ex: `/{id}.png`.
-    ParamSuffix { suffix: Vec<u8> },
+    ParamSuffix { suffixes: Vec<Vec<u8>> },
     /// A catchall parameter, ex: `/*file`
     CatchAll,
     /// Anything else
@@ -138,6 +138,8 @@ impl<T> Node<T> {
                         || (current.prefix.len() < prefix.len()
                             && prefix[current.prefix.len()] != b'/')
                     {
+                        dbg!(std::str::from_utf8(&current.prefix));
+                        dbg!(std::str::from_utf8(&prefix));
                         return Err(InsertError::conflict(&route, prefix, current));
                     }
 
@@ -219,6 +221,7 @@ impl<T> Node<T> {
                     return Ok(current);
                 }
             };
+            dbg!(std::str::from_utf8(&wildcard));
 
             // catch-all route
             if wildcard[1] == b'*' {
@@ -280,7 +283,7 @@ impl<T> Node<T> {
                     prefix = &prefix[end..];
 
                     NodeType::ParamSuffix {
-                        suffix: suffix.to_owned(),
+                        suffixes: vec![suffix.to_owned()],
                     }
                 }
             };
@@ -296,9 +299,8 @@ impl<T> Node<T> {
             current = &mut current.children[child];
             current.priority += 1;
 
-            // if the route doesn't end with the wildcard, then there
-            // will be another static subroute or suffix
-            if wildcard.len() < prefix.len() {
+            // if the route doesn't end with the wildcard/suffix, then there will be another static subroute
+            if prefix.len() > 0 {
                 let child = Self {
                     priority: 1,
                     ..Self::default()
@@ -448,59 +450,61 @@ impl<T> Node<T> {
                                 }
                             }
                         }
-                        NodeType::ParamSuffix { suffix } => {
-                            if path.len() < suffix.len() {
-                                return Err(MatchError::NotFound);
-                            }
-
-                            for i in 0..path.len() {
-                                if path[i] == b'/' {
-                                    return Err(MatchError::NotFound);
+                        NodeType::ParamSuffix { suffixes } => {
+                            for suffix in suffixes {
+                                if path.len() < suffix.len() {
+                                    continue;
                                 }
 
-                                if path[i] == suffix[0] {
-                                    if path.len() - i < suffix.len() {
-                                        return Err(MatchError::NotFound);
-                                    }
-
-                                    if path[i..][..suffix.len()] != *suffix {
+                                for i in 0..path.len() {
+                                    if path[i] == b'/' {
                                         continue;
                                     }
 
-                                    let param = &path[..i];
-                                    let rest = &path[i + suffix.len()..];
+                                    if path[i] == suffix[0] {
+                                        if path.len() - i < suffix.len() {
+                                            return Err(MatchError::NotFound);
+                                        }
 
-                                    if let [child] = current.children.as_slice() {
+                                        if path[i..][..suffix.len()] != *suffix {
+                                            continue;
+                                        }
+
+                                        let param = &path[..i];
+                                        let rest = &path[i + suffix.len()..];
+
+                                        if let [child] = current.children.as_slice() {
+                                            // store the parameter value
+                                            params.push(b"", param);
+
+                                            // continue with the child node
+                                            path = rest;
+                                            current = child;
+                                            backtracking = false;
+                                            continue 'walk;
+                                        }
+
                                         // store the parameter value
                                         params.push(b"", param);
 
-                                        // continue with the child node
-                                        path = rest;
-                                        current = child;
-                                        backtracking = false;
-                                        continue 'walk;
+                                        // found the matching value
+                                        if let Some(ref value) = current.value {
+                                            // remap parameter keys
+                                            params.for_each_key_mut(|(i, key)| {
+                                                *key = &current.param_remapping[i]
+                                            });
+
+                                            return Ok((value, params));
+                                        }
                                     }
-
-                                    // store the parameter value
-                                    params.push(b"", param);
-
-                                    // found the matching value
-                                    if let Some(ref value) = current.value {
-                                        // remap parameter keys
-                                        params.for_each_key_mut(|(i, key)| {
-                                            *key = &current.param_remapping[i]
-                                        });
-
-                                        return Ok((value, params));
-                                    }
-
-                                    // no match, try backtracking
-                                    try_backtrack!();
-
-                                    // this node doesn't have the value, no match
-                                    return Err(MatchError::NotFound);
                                 }
                             }
+
+                            // no match, try backtracking
+                            try_backtrack!();
+
+                            // none of the suffixes matched
+                            return Err(MatchError::NotFound);
                         }
                         NodeType::CatchAll => {
                             // catch all segments are only allowed at the end of the route,
@@ -714,7 +718,7 @@ impl<T> Default for Node<T> {
     }
 }
 
-#[cfg(test)]
+//#[cfg(test)]
 const _: () = {
     use std::fmt::{self, Debug, Formatter};
 
@@ -739,6 +743,7 @@ const _: () = {
             f.debug_struct("Node")
                 .field("value", &value)
                 .field("prefix", &std::str::from_utf8(&self.prefix))
+                .field("wild_child", &self.wild_child)
                 .field("node_type", &self.node_type)
                 .field("children", &self.children)
                 .field("param_names", &param_names)

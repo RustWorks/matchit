@@ -4,8 +4,12 @@ use matchit::{MatchError, Router};
 fn param_suffix() {
     let mut x = Router::new();
     x.insert("/{foo}x", "Welcome!").unwrap();
+    dbg!(&x);
+    dbg!("---");
+    x.insert("/{foo}z", "Welcome!").unwrap();
     assert_eq!(x.at("/fy").unwrap_err(), MatchError::NotFound);
     dbg!(x.at("/fx").unwrap());
+    dbg!(x.at("/fz").unwrap());
 
     let mut x = Router::new();
     x.insert("/{foo}x/bar", "Welcome!").unwrap();
